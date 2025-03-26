@@ -45,6 +45,14 @@ pub struct RpcResponseContext {
     pub api_version: Option<RpcApiVersion>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcResponseContextWithBlockHash {
+    #[serde(flatten)]
+    pub context: RpcResponseContext,
+    pub block_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcApiVersion(semver::Version);
 
@@ -91,9 +99,24 @@ impl RpcResponseContext {
     }
 }
 
+impl RpcResponseContextWithBlockHash {
+    pub fn new(slot: Slot, block_hash: String) -> Self {
+        Self {
+            context: RpcResponseContext::new(slot),
+            block_hash,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response<T> {
     pub context: RpcResponseContext,
+    pub value: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseWithBlockHash<T> {
+    pub context: RpcResponseContextWithBlockHash,
     pub value: T,
 }
 

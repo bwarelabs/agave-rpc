@@ -52,7 +52,7 @@ use {
             MAX_GET_SLOT_LEADERS, MAX_MULTIPLE_ACCOUNTS,
             MAX_RPC_VOTE_ACCOUNT_INFO_EPOCH_CREDITS_HISTORY, NUM_LARGEST_ACCOUNTS,
         },
-        response::{Response as RpcResponse, *},
+        response::{Response as RpcResponse, ResponseWithBlockHash as RpcResponseWithBlockHash, *},
     },
     solana_runtime::{
         bank::{Bank, TransactionSimulationResult},
@@ -140,6 +140,14 @@ pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     RpcResponse {
         context: RpcResponseContext::new(bank.slot()),
+        value,
+    }
+}
+
+fn new_response_with_block_hash<T>(bank: &Bank, value: T) -> RpcResponseWithBlockHash<T> {
+    let slot = bank.slot();
+    RpcResponseWithBlockHash {
+        context: RpcResponseContextWithBlockHash::new(slot, bank.last_blockhash().to_string()),
         value,
     }
 }
@@ -379,6 +387,15 @@ impl JsonRpcRequestProcessor {
         })
     }
 
+    #[allow(deprecated)]
+    fn bank_at_slot(&self, slot: Slot) -> Result<Arc<Bank>> {
+        let r_bank_forks = self.bank_forks.read().unwrap();
+        match r_bank_forks.get(slot) {
+            Some(value) => Ok(value),
+            None => Err(RpcCustomError::BlockNotAvailable { slot }.into()),
+        }
+    }
+
     fn genesis_creation_time(&self) -> UnixTimestamp {
         self.bank(None).genesis_creation_time()
     }
@@ -571,6 +588,34 @@ impl JsonRpcRequestProcessor {
             );
         }
         Ok(new_response(&bank, accounts))
+    }
+
+    pub async fn get_multiple_accounts_at_slot(
+        &self,
+        pubkeys: Vec<Pubkey>,
+        config: Option<RpcAccountInfoAtSlotConfig>,
+    ) -> Result<RpcResponseWithBlockHash<Vec<Option<UiAccount>>>> {
+        let RpcAccountInfoAtSlotConfig {
+            encoding,
+            data_slice,
+            slot,
+        } = config.unwrap_or_default();
+        let bank = self.bank_at_slot(slot)?;
+        let encoding = encoding.unwrap_or(UiAccountEncoding::Base64);
+
+        let mut accounts = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let bank = Arc::clone(&bank);
+            accounts.push(
+                self.runtime
+                    .spawn_blocking(move || {
+                        get_encoded_account(&bank, &pubkey, encoding, data_slice, None)
+                    })
+                    .await
+                    .expect("rpc: get_encoded_account panicked")?,
+            );
+        }
+        Ok(new_response_with_block_hash(&bank, accounts))
     }
 
     pub fn get_minimum_balance_for_rent_exemption(
@@ -3204,6 +3249,14 @@ pub mod rpc_accounts {
             config: Option<RpcAccountInfoConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
 
+        #[rpc(meta, name = "getMultipleAccountsAtSlot")]
+        fn get_multiple_accounts_at_slot(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoAtSlotConfig>,
+        ) -> BoxFuture<Result<RpcResponseWithBlockHash<Vec<Option<UiAccount>>>>>;
+
         #[rpc(meta, name = "getBlockCommitment")]
         fn get_block_commitment(
             &self,
@@ -3275,6 +3328,35 @@ pub mod rpc_accounts {
                     .map(|pubkey_str| verify_pubkey(&pubkey_str))
                     .collect::<Result<Vec<_>>>()?;
                 meta.get_multiple_accounts(pubkeys, config).await
+            }
+            .boxed()
+        }
+
+        fn get_multiple_accounts_at_slot(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoAtSlotConfig>,
+        ) -> BoxFuture<Result<RpcResponseWithBlockHash<Vec<Option<UiAccount>>>>> {
+            debug!(
+                "get_multiple_accounts rpc request received: {:?}",
+                pubkey_strs.len()
+            );
+            async move {
+                let max_multiple_accounts = meta
+                    .config
+                    .max_multiple_accounts
+                    .unwrap_or(MAX_MULTIPLE_ACCOUNTS);
+                if pubkey_strs.len() > max_multiple_accounts {
+                    return Err(Error::invalid_params(format!(
+                        "Too many inputs provided; max {max_multiple_accounts}"
+                    )));
+                }
+                let pubkeys = pubkey_strs
+                    .into_iter()
+                    .map(|pubkey_str| verify_pubkey(&pubkey_str))
+                    .collect::<Result<Vec<_>>>()?;
+                meta.get_multiple_accounts_at_slot(pubkeys, config).await
             }
             .boxed()
         }
@@ -5624,6 +5706,21 @@ pub mod tests {
             }
         ]);
         assert_eq!(result.value, expected);
+        bank.set_block_id(Some([1; 32].into()));
+        let request = create_test_request(
+            "getMultipleAccountsAtSlot",
+            Some(json!([[
+                rpc.mint_keypair.pubkey().to_string(),
+                non_existent_pubkey.to_string(),
+                address,
+            ],
+            {"encoding": "base58", "slot": bank.slot()}
+            ])),
+        );
+        let result: RpcResponseWithBlockHash<Value> =
+            parse_success_result(rpc.handle_request_sync(request));
+        println!("{:?}", bank.block_id());
+        println!("{:?}", result);
 
         // Test config settings still work with multiple accounts
         let request = create_test_request(
