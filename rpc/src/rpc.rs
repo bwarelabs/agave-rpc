@@ -389,9 +389,19 @@ impl JsonRpcRequestProcessor {
 
     #[allow(deprecated)]
     fn bank_at_slot(&self, slot: Slot) -> Result<Arc<Bank>> {
-        let r_bank_forks = self.bank_forks.read().unwrap();
-        match r_bank_forks.get(slot) {
-            Some(value) => Ok(value),
+        // only access slots that have been fully replayed and have a final block hash
+        let last_processed_slot = self
+            .block_commitment_cache
+            .read()
+            .unwrap()
+            .slot_with_commitment(CommitmentLevel::Processed);
+
+        if slot > last_processed_slot {
+            return Err(RpcCustomError::BlockNotAvailable { slot }.into());
+        }
+
+        match self.bank_forks.read().unwrap().get(slot) {
+            Some(bank) => Ok(bank),
             None => Err(RpcCustomError::BlockNotAvailable { slot }.into()),
         }
     }
@@ -5706,21 +5716,6 @@ pub mod tests {
             }
         ]);
         assert_eq!(result.value, expected);
-        bank.set_block_id(Some([1; 32].into()));
-        let request = create_test_request(
-            "getMultipleAccountsAtSlot",
-            Some(json!([[
-                rpc.mint_keypair.pubkey().to_string(),
-                non_existent_pubkey.to_string(),
-                address,
-            ],
-            {"encoding": "base58", "slot": bank.slot()}
-            ])),
-        );
-        let result: RpcResponseWithBlockHash<Value> =
-            parse_success_result(rpc.handle_request_sync(request));
-        println!("{:?}", bank.block_id());
-        println!("{:?}", result);
 
         // Test config settings still work with multiple accounts
         let request = create_test_request(
