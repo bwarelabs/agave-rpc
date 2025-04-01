@@ -46,7 +46,7 @@ use {
         pin::Pin,
         // CAUTION: be careful not to introduce any awaits while holding an RwLock.
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, RwLock,
         },
         task::Poll,
@@ -575,13 +575,14 @@ fn handle_and_cache_new_connection(
         let receive_window =
             compute_recieve_window(params.max_stake, params.min_stake, params.peer_type);
 
-        debug!(
-            "Peer type {:?}, total stake {}, max streams {} receive_window {:?} from peer {}",
+        info!(
+            "[quic_server_bench] Peer type {:?}, total stake {}, max streams {} receive_window {:?} from peer {} - conn id: {}",
             params.peer_type,
             params.total_stake,
             max_uni_streams.into_inner(),
             receive_window,
             remote_addr,
+            connection.stable_id()
         );
 
         if let Some((last_update, cancel_connection, stream_counter)) = connection_table_l
@@ -1049,13 +1050,17 @@ async fn handle_connection(
         ..
     } = params;
 
-    debug!(
-        "quic new connection {} streams: {} connections: {}",
+    info!(
+        "[quic_server_bench] quic new connection {} streams: {} connections: {} connection_id: {}",
         remote_addr,
         stats.total_streams.load(Ordering::Relaxed),
         stats.total_connections.load(Ordering::Relaxed),
+        connection.stable_id()
     );
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+    let mut connection_received_bytes: usize = 0;
+    let connection_streams_received: AtomicUsize = AtomicUsize::new(0);
 
     'conn: loop {
         // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
@@ -1070,6 +1075,7 @@ async fn handle_connection(
             },
             _ = cancel.cancelled() => break,
         };
+        connection_streams_received.fetch_add(1, Ordering::SeqCst);
 
         let max_streams_per_throttling_interval =
             stream_load_ema.available_load_capacity_in_throttling_duration(peer_type, total_stake);
@@ -1155,6 +1161,10 @@ async fn handle_connection(
                 }
             };
 
+            for chunk in chunks.iter() {
+                connection_received_bytes += chunk.len();
+            }
+
             match handle_chunks(
                 // Bytes::clone() is a cheap atomic inc
                 chunks.iter().take(n_chunks).cloned(),
@@ -1190,6 +1200,13 @@ async fn handle_connection(
     }
 
     let stable_id = connection.stable_id();
+    info!(
+        "[quic_server_bench] quic connection disconnected: peer {} connection_id: {} connection_received_bytes {} connection_streams_received {}",
+        remote_addr,
+        connection.stable_id(),
+        connection_received_bytes,
+        connection_streams_received.load(Ordering::SeqCst)
+    );
     let removed_connection_count = connection_table.lock().await.remove_connection(
         ConnectionTableKey::new(remote_addr.ip(), remote_pubkey),
         remote_addr.port(),
