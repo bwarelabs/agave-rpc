@@ -1060,8 +1060,9 @@ async fn handle_connection(
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
     let mut connection_received_bytes: usize = 0;
-    let connection_streams_received: AtomicUsize = AtomicUsize::new(0);
+    let mut connection_streams_received: AtomicUsize = AtomicUsize::new(0);
 
+    let mut last_stats_report = tokio::time::Instant::now();
     'conn: loop {
         // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
         // the connection task.
@@ -1075,7 +1076,7 @@ async fn handle_connection(
             },
             _ = cancel.cancelled() => break,
         };
-        connection_streams_received.fetch_add(1, Ordering::SeqCst);
+        connection_streams_received.fetch_add(1, Ordering::Relaxed);
 
         let max_streams_per_throttling_interval =
             stream_load_ema.available_load_capacity_in_throttling_duration(peer_type, total_stake);
@@ -1089,10 +1090,13 @@ async fn handle_connection(
                 STREAM_THROTTLING_INTERVAL.saturating_sub(throttle_interval_start.elapsed());
 
             if !throttle_duration.is_zero() {
-                debug!("Throttling stream from {remote_addr:?}, peer type: {:?}, total stake: {}, \
+                let time_since_last_stats_report = last_stats_report.elapsed().as_secs_f64();
+                if time_since_last_stats_report >= 10.0 {
+                    info!("[quic_server_bench] Throttling stream from {remote_addr:?}, peer type: {:?}, total stake: {}, \
                                     max_streams_per_interval: {max_streams_per_throttling_interval}, read_interval_streams: {streams_read_in_throttle_interval} \
                                     throttle_duration: {throttle_duration:?}",
                                     peer_type, total_stake);
+                }
                 stats.throttled_streams.fetch_add(1, Ordering::Relaxed);
                 match peer_type {
                     ConnectionPeerType::Unstaked => {
@@ -1193,6 +1197,23 @@ async fn handle_connection(
                     break 'conn;
                 }
             }
+        }
+
+        let time_since_last_stats_report = last_stats_report.elapsed().as_secs_f64();
+        if time_since_last_stats_report >= 10.0 {
+            info!(
+            "[quic_server_bench] active connection stats: peer {} connection_id: {} connection_received_bytes {} connection_streams_received {} max_streams_per_throttling_interval {}",
+            remote_addr,
+            connection.stable_id(),
+            connection_received_bytes as f64 / time_since_last_stats_report,
+            connection_streams_received.load(Ordering::Relaxed)as f64 / time_since_last_stats_report,
+            max_streams_per_throttling_interval
+            );
+
+            // reset all stats
+            connection_received_bytes = 0;
+            connection_streams_received = AtomicUsize::new(0);
+            last_stats_report = tokio::time::Instant::now();
         }
 
         stats.total_streams.fetch_sub(1, Ordering::Relaxed);
